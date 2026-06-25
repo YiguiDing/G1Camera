@@ -1,0 +1,14 @@
+{
+  "name": "g1-camera",
+  "version": "1.0.0",
+  "description": "G1 Camera Control Protocol Client",
+  "main": "index.ts",
+  "scripts": {
+    "start": "npx ts-node index.ts",
+    "build": "npx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
