@@ -1,4 +1,4 @@
-import { crc8, buildCommandPacket, parseResponsePacket, RW_GET, RW_SET } from './protocol';
+import { crc8, buildCommandPacket, parseResponsePacket, RW_GET, RW_SET } from './G1Camera';
 
 /**
  * CRC-8 和组包/解包自测

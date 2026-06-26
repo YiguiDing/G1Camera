@@ -10,14 +10,21 @@ import {
     crc8,
     buildCommandPacket,
     parseResponsePacket,
-} from './protocol';
-import { G1Camera } from './G1Camera';
+    G1Camera,
+} from './G1Camera';
+import { Driver, ExtractResult, PendingCommand, DEFAULT_TIMEOUT as DRIVER_DEFAULT_TIMEOUT } from './Driver';
 
 // ============================================================
 // Export public API
 // ============================================================
 
 export {
+    // Generic driver base class
+    Driver,
+    ExtractResult,
+    PendingCommand,
+    DRIVER_DEFAULT_TIMEOUT,
+    // G1-specific protocol
     crc8,
     buildCommandPacket,
     parseResponsePacket,

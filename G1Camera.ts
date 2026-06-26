@@ -1,29 +1,195 @@
 import * as net from 'net';
-import {
-    HEADER_RESPONSE,
-    DEFAULT_PORT,
-    DEFAULT_TIMEOUT,
-    ParamType,
-    ParsedResponse,
-    PendingCommand,
-    buildCommandPacket,
-    parseResponsePacket,
-    PARAM_DEFS,
-    RW_GET,
-    RW_SET,
-} from './protocol';
+import { Duplex } from 'stream';
+import { Driver, ExtractResult } from './Driver';
 
 // ============================================================
-// G1Camera Class
+// G1 Protocol Constants
 // ============================================================
 
-export class G1Camera {
-    private socket: net.Socket | null = null;
-    private receiveBuffer: Buffer = Buffer.alloc(0);
-    private pending: PendingCommand | null = null;
+export const HEADER_COMMAND  = 0xAA;
+export const HEADER_RESPONSE = 0x55;
+const TYPE_CONFIG            = 0x07;
+export const RW_GET          = 0x00;
+export const RW_SET          = 0x01;
+
+const CRC_POLY = 0xD5;
+
+export const DEFAULT_PORT    = 8888;
+export const DEFAULT_TIMEOUT = 5000;
+
+// ============================================================
+// G1 Protocol Types
+// ============================================================
+
+export enum ParamType {
+    Int    = 'int',
+    String = 'string',
+}
+
+export interface ParamDef {
+    id: number;
+    name: string;
+    type: ParamType;
+    /** Human-readable value labels (int params) */
+    values?: Record<number, string>;
+    defaultValue?: number | string;
+    /** Byte count for int params (1 or 2, default 1) */
+    byteCount?: number;
+}
+
+export interface ParsedResponse {
+    rw: number;
+    status: number;
+    data: Buffer;
+}
+
+// ============================================================
+// CRC-8 Checksum  (poly = 0xD5)
+// ============================================================
+
+export function crc8(data: Buffer | number[]): number {
+    let crc = 0x00;
+    const bytes = Buffer.isBuffer(data) ? [...data] : data;
+    for (const b of bytes) {
+        crc ^= b;
+        for (let i = 0; i < 8; i++) {
+            if (crc & 0x80) {
+                crc = ((crc << 1) ^ CRC_POLY) & 0xFF;
+            } else {
+                crc = (crc << 1) & 0xFF;
+            }
+        }
+    }
+    return crc;
+}
+
+// ============================================================
+// Packet Build / Parse  (G1 protocol)
+// ============================================================
+
+/** Build a G1 command packet (module-level helper). */
+export function buildCommandPacket(paramId: number, rw: number, data?: Buffer): Buffer {
+    const dataLen = data ? data.length : 0;
+    const totalLen = 5 + dataLen + 1; // header(1) + len(1) + type(1) + rw(1) + paramId(1) + data + checksum(1)
+
+    const header = Buffer.from([HEADER_COMMAND, totalLen, TYPE_CONFIG, rw, paramId]);
+    const beforeCrc = data ? Buffer.concat([header, data]) : header;
+
+    const c = crc8(beforeCrc);
+    return Buffer.concat([beforeCrc, Buffer.from([c])]);
+}
+
+/** Parse a raw G1 response packet (module-level helper). */
+export function parseResponsePacket(buffer: Buffer): ParsedResponse | null {
+    if (buffer.length < 2) return null;           // need header + length
+
+    const header = buffer[0];
+    if (header !== HEADER_RESPONSE) return null;  // not a valid response start
+
+    const len = buffer[1];
+    if (buffer.length < len) return null;          // incomplete packet
+
+    const packet = buffer.subarray(0, len);
+
+    // Verify CRC-8 over all bytes except the checksum itself
+    const expectedCrc = crc8(packet.subarray(0, len - 1));
+    if (expectedCrc !== packet[len - 1]) {
+        throw new Error(
+            `CRC mismatch: expected 0x${expectedCrc.toString(16).padStart(2, '0')}, ` +
+            `got 0x${packet[len - 1].toString(16).padStart(2, '0')}`
+        );
+    }
+
+    const rw     = packet[3];
+    // byte 4+ is the payload: for GET-int it's [value], for GET-str it's [0x00, string...], for SET it's [0x02, echoed...]
+    const status = packet.length > 4 ? packet[4] : 0;
+    const data   = packet.subarray(4, len - 1);
+
+    return { rw, status, data };
+}
+
+// ============================================================
+// Parameter Definitions Table
+// ============================================================
+
+export const PARAM_DEFS: Record<number, ParamDef> = {
+    // ---- 照片参数 ----
+    0x00: { id: 0x00, name: 'imageSize',                    type: ParamType.Int, values: { 0: '20M', 1: '13M', 2: '12M', 3: '10M', 4: '8M', 5: '5M', 6: '3M', 7: '2M' }, defaultValue: 2 },
+    0x01: { id: 0x01, name: 'photoDelayTimer',              type: ParamType.Int, values: { 0: 'OFF', 1: '3S', 2: '5S', 3: '7S' }, defaultValue: 0 },
+    0x02: { id: 0x02, name: 'photoLDC',                     type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x03: { id: 0x03, name: 'photoTimeLapseInterval',       type: ParamType.Int, values: { 0: 'OFF', 1: '1S', 2: '2S', 3: '3S', 4: '4S', 5: '5S', 6: '6S', 7: '7S', 8: '8S', 9: '10S', 10: '13S', 11: '15S', 12: '20S', 13: '25S', 14: '30S', 15: '40S', 16: '60S' }, defaultValue: 0 },
+    0x04: { id: 0x04, name: 'timeLapsePhotoShootingTime',   type: ParamType.Int, values: { 0: 'Unlimited', 1: '1MIN', 2: '3MIN', 3: '5MIN', 4: '10MIN', 5: '20MIN', 6: '30MIN', 7: '1H', 8: '2H', 9: '3H', 10: '5H' }, defaultValue: 0 },
+    0x05: { id: 0x05, name: 'stillStampMode',               type: ParamType.Int, values: { 0: 'OFF', 1: 'DATE', 2: 'DATETIME' }, defaultValue: 0 },
+    0x3F: { id: 0x3F, name: 'capRotation',                  type: ParamType.Int },
+
+    // ---- 录像参数 ----
+    0x07: { id: 0x07, name: 'videoSize',                    type: ParamType.Int, values: { 0: '4K', 1: '2.7K', 2: '1440P', 3: '1080P', 4: '720P' }, defaultValue: 0 },
+    0x08: { id: 0x08, name: 'frameRate',                    type: ParamType.Int, values: { 0: '24fps', 1: '25fps', 2: '30fps', 3: '48fps', 4: '50fps', 5: '60fps', 6: '120fps', 7: '240fps' }, defaultValue: 2 },
+    0x09: { id: 0x09, name: 'slowMotionMode',               type: ParamType.Int, values: { 0: 'OFF', 1: '2x slow', 2: '4x slow', 3: '8x slow' }, defaultValue: 0 },
+    0x0A: { id: 0x0A, name: 'videoFastMotion',              type: ParamType.Int, values: { 0: 'OFF', 1: '2X', 2: '5X', 3: '10X', 4: '15X', 5: '30X' }, defaultValue: 0 },
+    0x0B: { id: 0x0B, name: 'videoTimeLapseInterval',       type: ParamType.Int, values: { 0: 'OFF', 1: '1S', 2: '2S', 3: '3S', 4: '4S', 5: '5S', 6: '6S', 7: '7S', 8: '8S', 9: '10S', 10: '13S', 11: '15S', 12: '20S', 13: '25S', 14: '30S', 15: '40S', 16: '60S' }, defaultValue: 0 },
+    0x0C: { id: 0x0C, name: 'timeLapseVideoShootingTime',   type: ParamType.Int, values: { 0: 'Unlimited', 1: '1MIN', 2: '3MIN', 3: '5MIN', 4: '10MIN', 5: '20MIN', 6: '30MIN', 7: '1H', 8: '2H', 9: '3H', 10: '5H' }, defaultValue: 0 },
+    0x0D: { id: 0x0D, name: 'preRec',                       type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x0E: { id: 0x0E, name: 'videoImageStabilization',      type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x10: { id: 0x10, name: 'videoQuality',                 type: ParamType.Int, values: { 0: 'Superfine', 1: 'Fine', 2: 'Normal' }, defaultValue: 2 },
+    0x11: { id: 0x11, name: 'rotation',                     type: ParamType.Int, values: { 0: 'Normal', 1: 'Vertical', 2: 'Level', 3: '270°' }, defaultValue: 0 },
+    0x13: { id: 0x13, name: 'ldc',                          type: ParamType.Int },
+    0x14: { id: 0x14, name: 'metering',                     type: ParamType.Int, values: { 0: 'Center', 1: 'Multi', 2: 'Spot' }, defaultValue: 1 },
+    0x15: { id: 0x15, name: 'seamless',                     type: ParamType.Int, values: { 0: 'Unlimited', 1: '1MIN', 2: '3MIN', 3: '5MIN' }, defaultValue: 0 },
+    0x16: { id: 0x16, name: 'cyclicRec',                    type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x17: { id: 0x17, name: 'recVol',                       type: ParamType.Int, values: { 0: 'Mute', 1: 'Low', 2: 'Middle', 3: 'High' }, defaultValue: 2 },
+    0x18: { id: 0x18, name: 'videoStampMode',               type: ParamType.Int, values: { 0: 'OFF', 1: 'DATE', 2: 'DATETIME' }, defaultValue: 0 },
+    0x19: { id: 0x19, name: 'videoFileFormat',              type: ParamType.Int, values: { 1: 'MOV', 2: 'MP4' }, defaultValue: 1 },
+    0x1A: { id: 0x1A, name: 'videoVFI',                     type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+
+    // ---- 系统设置 ----
+    0x1B: { id: 0x1B, name: 'screenSaverTime',              type: ParamType.Int, values: { 0: 'OFF', 1: '1MIN', 2: '3MIN', 3: '5MIN' }, defaultValue: 0 },
+    0x1C: { id: 0x1C, name: 'sleepTime',                    type: ParamType.Int, values: { 0: 'OFF', 1: '1MIN', 2: '3MIN', 3: '5MIN', 4: '10MIN', 5: '15MIN' }, defaultValue: 0 },
+    0x1D: { id: 0x1D, name: 'autoRecording',                type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x1F: { id: 0x1F, name: 'lightFreq',                    type: ParamType.Int, values: { 0: 'OFF', 1: '50HZ', 2: '60HZ' }, defaultValue: 0 },
+    0x20: { id: 0x20, name: 'beepSound',                    type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x21: { id: 0x21, name: 'volume',                       type: ParamType.Int, values: { 0: 'OFF', 1: '1', 2: '2', 3: '3' }, defaultValue: 2 },
+    0x22: { id: 0x22, name: 'soundChoice',                  type: ParamType.Int, values: { 0: 'BEEP', 1: 'SPEAKER' }, defaultValue: 0 },
+    0x23: { id: 0x23, name: 'audioCodec',                   type: ParamType.Int, values: { 0: 'Internal', 1: 'External' }, defaultValue: 0 },
+    0x24: { id: 0x24, name: 'switchSecondAudio',            type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x25: { id: 0x25, name: 'autoOpenWifi',                 type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x26: { id: 0x26, name: 'wifiFrequencyBand',            type: ParamType.Int, values: { 0: '2.4G', 1: '5G' }, defaultValue: 1 },
+    0x27: { id: 0x27, name: 'fillLightA',                   type: ParamType.Int, values: { 0: 'Close', 1: 'Open' }, defaultValue: 0 },
+    0x28: { id: 0x28, name: 'fillLightB',                   type: ParamType.Int, values: { 0: 'Auto', 1: 'Close', 2: 'Open' }, defaultValue: 0 },
+    0x29: { id: 0x29, name: 'irCut',                        type: ParamType.Int },
+    0x31: { id: 0x31, name: 'usbMode',                      type: ParamType.Int, values: { 0: 'USB', 1: 'PCCAM' }, defaultValue: 0 },
+    0x32: { id: 0x32, name: 'autoWifiRec',                  type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x33: { id: 0x33, name: 'hdmiSize',                     type: ParamType.Int, values: { 0: 'AUTO', 1: '3840x2160P_30HZ', 2: '1920x1080P_60HZ', 3: '1920x1080P_30HZ', 4: '1280x720P_60HZ' }, defaultValue: 0 },
+    0x34: { id: 0x34, name: 'uvcBitrate',                   type: ParamType.Int, defaultValue: 20 },
+    0x35: { id: 0x35, name: 'usbAutoPWROn',                 type: ParamType.Int, values: { 0: 'Close', 1: 'Open' }, defaultValue: 1 },
+    0x36: { id: 0x36, name: 'invertMode',                   type: ParamType.Int, values: { 0: 'OFF', 1: 'ON' }, defaultValue: 0 },
+    0x37: { id: 0x37, name: 'wifiAutoClose',                type: ParamType.Int, values: { 0: 'OFF', 1: '1MIN', 2: '2MIN', 3: '3MIN' }, defaultValue: 0 },
+    0x38: { id: 0x38, name: 'wifiMode',                     type: ParamType.Int, values: { 0: 'AP', 1: 'STA' }, defaultValue: 0 },
+    0x39: { id: 0x39, name: 'iqStamp',                      type: ParamType.Int, values: { 0: 'CLOSE', 1: 'OPEN' }, defaultValue: 0 },
+    0x3A: { id: 0x3A, name: 'staticIP',                     type: ParamType.Int, values: { 0: 'Dynamic', 1: 'Static' }, defaultValue: 1 },
+    0x3B: { id: 0x3B, name: 'portNumber',                   type: ParamType.Int, byteCount: 2 },
+
+    // ---- 字符串参数 ----
+    0x7F: { id: 0x7F, name: 'wifiSSID',                     type: ParamType.String },
+    0x80: { id: 0x80, name: 'wifiPassword',                 type: ParamType.String },
+    0x81: { id: 0x81, name: 'customWifiSSID',               type: ParamType.String },
+    0x82: { id: 0x82, name: 'customWifiPassword',           type: ParamType.String },
+    0x83: { id: 0x83, name: 'netIp',                        type: ParamType.String },
+    0x84: { id: 0x84, name: 'netGateway',                   type: ParamType.String },
+    0x85: { id: 0x85, name: 'cameraTime',                   type: ParamType.String },
+};
+
+// ============================================================
+// G1Camera Class — extends generic Driver for G1-camera protocol
+// ============================================================
+
+export class G1Camera extends Driver<ParsedResponse> {
     private host: string = '';
     private port: number = DEFAULT_PORT;
-    private timeout: number = DEFAULT_TIMEOUT;
+
+    constructor() {
+        super(undefined, DEFAULT_TIMEOUT);
+    }
 
     // ---- Connection ----
 
@@ -34,16 +200,13 @@ export class G1Camera {
      */
     connect(host: string, port: number = DEFAULT_PORT): Promise<void> {
         return new Promise((resolve, reject) => {
-            if (this.socket) {
-                this.disconnect();
-            }
+            // Detach any previous connection
+            this.detachStream();
 
             this.host = host;
             this.port = port;
-            this.receiveBuffer = Buffer.alloc(0);
 
             const sock = new net.Socket();
-            this.socket = sock;
 
             const onError = (err: Error) => {
                 sock.removeListener('connect', onConnect);
@@ -52,93 +215,64 @@ export class G1Camera {
 
             const onConnect = () => {
                 sock.removeListener('error', onError);
+                this.attachStream(sock as Duplex);
                 resolve();
             };
 
             sock.once('error', onError);
             sock.once('connect', onConnect);
 
-            sock.on('data', (chunk: Buffer) => this.onData(chunk));
-            sock.on('close', () => this.onClose());
-            sock.on('error', (err: Error) => this.onError(err));
-
             sock.connect(port, host);
         });
     }
 
-    /**
-     * 断开与相机的连接
-     */
-    disconnect(): void {
-        if (this.pending) {
-            clearTimeout(this.pending.timer);
-            this.pending.reject(new Error('Disconnected'));
-            this.pending = null;
+    // ============================================================
+    // Driver abstract method implementations
+    // ============================================================
+
+    /** Build a G1 command packet from [paramId, rw, data?]. */
+    protected buildCommandPacket(...args: unknown[]): Buffer {
+        const [paramId, rw, data] = args as [number, number, Buffer | undefined];
+        return buildCommandPacket(paramId, rw, data);
+    }
+
+    /** Parse a raw G1 response packet. Throws on CRC / format failure. */
+    protected parseResponsePacket(packet: Buffer): ParsedResponse {
+        const parsed = parseResponsePacket(packet);
+        if (!parsed) {
+            throw new Error('Invalid response packet');
         }
-        if (this.socket) {
-            this.socket.destroy();
-            this.socket = null;
+        return parsed;
+    }
+
+    /**
+     * Extract one complete G1 response packet from the receive buffer.
+     *
+     * G1 packets start with header 0x55, byte 1 is total length.
+     * Garbage before the header is silently skipped.
+     * If no header is found at all the entire buffer is cleared.
+     */
+    protected extractPacket(): ExtractResult | null {
+        const buf = this.receiveBuffer;
+        if (buf.length < 2) return null;
+
+        const headerIdx = buf.indexOf(HEADER_RESPONSE);
+        if (headerIdx === -1) {
+            // No valid start marker — clear everything
+            this.receiveBuffer = Buffer.alloc(0);
+            return null;
         }
+
+        const len = buf[headerIdx + 1];
+        if (buf.length < headerIdx + len) return null; // incomplete packet
+
+        const packet = buf.subarray(headerIdx, headerIdx + len);
+        return { packet, consumed: headerIdx + len };
     }
 
-    /**
-     * 是否已连接
-     */
-    isConnected(): boolean {
-        return this.socket !== null && !this.socket.destroyed;
-    }
-
-    // ---- Low-level Send ----
-
-    /**
-     * 直接发送原始数据到相机（底层接口）
-     * @param data 要发送的数据
-     */
-    send(data: Buffer | number[]): Promise<void> {
-        return new Promise((resolve, reject) => {
-            if (!this.socket || this.socket.destroyed) {
-                return reject(new Error('Not connected'));
-            }
-            const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-            this.socket.write(buf, (err) => {
-                if (err) return reject(err);
-                resolve();
-            });
-        });
-    }
-
-    // ---- Core Protocol ----
-
-    /**
-     * 发送命令并等待响应
-     */
-    private sendCommand(paramId: number, rw: number, data?: Buffer): Promise<ParsedResponse> {
-        return new Promise((resolve, reject) => {
-            if (!this.socket || this.socket.destroyed) {
-                return reject(new Error('Not connected'));
-            }
-            if (this.pending) {
-                return reject(new Error('Command already in progress'));
-            }
-
-            const packet = buildCommandPacket(paramId, rw, data);
-
-            const timer = setTimeout(() => {
-                this.pending = null;
-                reject(new Error(`Command timeout (${this.timeout}ms)`));
-            }, this.timeout);
-
-            this.pending = { resolve, reject, timer };
-
-            this.socket.write(packet, (err) => {
-                if (err) {
-                    clearTimeout(timer);
-                    this.pending = null;
-                    reject(err);
-                }
-            });
-        });
-    }
+    // ============================================================
+    // High-level Param API
+    // ============================================================
 
     /**
      * 读取参数值
@@ -150,21 +284,15 @@ export class G1Camera {
         if (!def) throw new Error(`Unknown param ID: 0x${paramId.toString(16).toUpperCase()}`);
 
         const resp = await this.sendCommand(paramId, RW_GET);
-        // CRC already validates packet integrity; byte4 indicates payload type:
-        // 0 = GET返回字符串, 1 = GET返回整数, 2 = SET确认
-        // For GET, byte4 IS the value for int params, so we don't check it as status
 
         if (def.type === ParamType.String) {
-            // data = [0x00, string_bytes...], skip the leading type byte
             return resp.data.length > 1 ? resp.data.subarray(1).toString('ascii') : '';
         }
 
         // Int type
         if (def.byteCount === 2) {
-            // 2字节参数响应: data = [0x01, low, high], 跳过 type byte
             return resp.data.length >= 3 ? resp.data.readUInt16LE(1) : resp.data.readUInt16LE(0);
         }
-        // 1字节参数: data = [value], 无 type byte 前缀
         return resp.data.length > 0 ? resp.data[0] : 0;
     }
 
@@ -191,78 +319,8 @@ export class G1Camera {
         }
 
         const resp = await this.sendCommand(paramId, RW_SET, data);
-        // SET 响应 data[0]=0x02 表示成功，其他值表示失败
         if (resp.data.length === 0 || (resp.data[0] !== 0x00 && resp.data[0] !== 0x02)) {
             throw new Error(`SET param 0x${paramId.toString(16)} failed: ack=${resp.data.length > 0 ? resp.data[0] : 'none'}`);
-        }
-    }
-
-    // ---- Stream Handling ----
-
-    private onData(chunk: Buffer): void {
-        this.receiveBuffer = Buffer.concat([this.receiveBuffer, chunk]);
-        this.tryExtractResponse();
-    }
-
-    private tryExtractResponse(): void {
-        while (this.receiveBuffer.length >= 2) {
-            // Scan for response header 0x55
-            const headerIdx = this.receiveBuffer.indexOf(HEADER_RESPONSE);
-            if (headerIdx === -1) {
-                this.receiveBuffer = Buffer.alloc(0);
-                return;
-            }
-            if (headerIdx > 0) {
-                this.receiveBuffer = this.receiveBuffer.subarray(headerIdx);
-            }
-
-            if (this.receiveBuffer.length < 2) return;
-
-            const len = this.receiveBuffer[1];
-            if (this.receiveBuffer.length < len) return;
-
-            const packet = this.receiveBuffer.subarray(0, len);
-            try {
-                const parsed = parseResponsePacket(packet);
-                if (!parsed) {
-                    return;
-                }
-                this.receiveBuffer = this.receiveBuffer.subarray(len);
-                this.handleResponse(parsed);
-            } catch (err: unknown) {
-                this.receiveBuffer = this.receiveBuffer.subarray(1);
-                if (this.pending) {
-                    clearTimeout(this.pending.timer);
-                    this.pending.reject(err as Error);
-                    this.pending = null;
-                }
-            }
-        }
-    }
-
-    private handleResponse(parsed: ParsedResponse): void {
-        if (this.pending) {
-            clearTimeout(this.pending.timer);
-            const p = this.pending;
-            this.pending = null;
-            p.resolve(parsed);
-        }
-    }
-
-    private onClose(): void {
-        if (this.pending) {
-            clearTimeout(this.pending.timer);
-            this.pending.reject(new Error('Connection closed'));
-            this.pending = null;
-        }
-        this.socket = null;
-    }
-
-    private onError(err: Error): void {
-        if (this.pending) {
-            clearTimeout(this.pending.timer);
-            this.pending.reject(err);
-            this.pending = null;
         }
     }
 

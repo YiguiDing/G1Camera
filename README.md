@@ -2,11 +2,13 @@
 
 基于 G1 相机串口控制协议，通过 TCP（默认端口 8888）对相机进行远程参数读写。
 
+核心收发 pipeline 已抽象为 `Driver` 基类，可复用于其他协议设备（串口、串口透传等）。
+
 ## 文件结构
 
 ```
-├── protocol.ts    # 协议层：常量、类型、CRC-8、组包/解包、参数定义表
-├── G1Camera.ts    # G1Camera 类：TCP 连接、命令收发、命名 getter/setter
+├── Driver.ts      # 通用抽象基类：收发 pipeline、超时、pending 互斥
+├── G1Camera.ts    # G1 协议：常量/类型/CRC-8/组包拆包/PARAM_DEFS + G1Camera 类
 ├── index.ts       # 入口：统一 re-export、dumpAll()、main() 示例
 ├── selfTest.ts    # CRC-8 与组包/解包自测（8 组测试向量）
 ├── package.json
@@ -23,6 +25,72 @@ npm install
 npx ts-node index.ts          # 连接相机，打印全部参数
 npx ts-node selfTest.ts       # 仅运行 CRC-8 与组包自测
 ```
+
+## 架构设计
+
+`Driver<TResponse>` 抽象了请求/响应式设备驱动的通用 pipeline：
+
+```
+sendCommand → buildCommandPacket → setTimeout → pending → write
+onData → concat → extractPacket → parseResponsePacket → handleResponse → clearTimeout → resolve
+```
+
+子类只需实现三个协议相关方法即可获得完整的连接管理、超时、错误恢复能力。
+
+### Driver 基类 (Driver.ts)
+
+```typescript
+export abstract class Driver<TResponse> {
+    // 子类必须实现
+    protected abstract buildCommandPacket(...args: unknown[]): Buffer;
+    protected abstract parseResponsePacket(packet: Buffer): TResponse;
+    protected abstract extractPacket(): ExtractResult | null;
+
+    // 核心 pipeline（protected，子类调用）
+    protected sendCommand(...args: unknown[]): Promise<TResponse>;
+
+    // 流生命周期
+    protected attachStream(stream: Duplex): void;
+    protected detachStream(): void;
+
+    // 公共 API
+    send(data: Buffer | number[]): Promise<void>;
+    disconnect(): void;
+    isConnected(): boolean;
+}
+```
+
+### 为其他设备写驱动
+
+三步即可适配一个新协议：
+
+```typescript
+class MyDevice extends Driver<MyResponse> {
+    // 1. 组包
+    protected buildCommandPacket(...args: unknown[]): Buffer {
+        const [cmd, ...params] = args;
+        return buildMyPacket(cmd, ...params);
+    }
+
+    // 2. 解包
+    protected parseResponsePacket(packet: Buffer): MyResponse {
+        return parseMyPacket(packet);
+    }
+
+    // 3. 帧提取（从流中切出完整帧）
+    protected extractPacket(): ExtractResult | null {
+        const buf = this.receiveBuffer;
+        // 按你的协议找出帧边界，返回 { packet, consumed }
+    }
+
+    // 业务 API
+    async getStatus(): Promise<Status> {
+        return this.sendCommand(CMD_GET_STATUS);
+    }
+}
+```
+
+`sendCommand` 自动处理：连接检查、pending 互斥（同时只能有一个命令在飞）、超时 reject、write 错误 reject。`onData` / `tryExtractLoop` 自动处理粘包半包、垃圾数据跳过、错误恢复。
 
 ## 协议格式
 
@@ -60,7 +128,7 @@ AA 06 07 00 83 50
 示例——设置 IP 为 192.168.1.65：
 ```
 AA 12 07 01 83 31 39 32 2E 31 36 38 2E 31 2E 36 35 E8
-                 └────── "192.168.1.65" ASCII ──────────┘ └── CRC-8
+                └────── "192.168.1.65" ASCII ──────────┘ └── CRC-8
 ```
 
 ### 响应包 (Camera → Host)
@@ -203,6 +271,8 @@ function crc8(data: Buffer | number[]): number {
 
 ```typescript
 import { G1Camera } from './index';
+// 或
+import { G1Camera } from './G1Camera';
 
 const camera = new G1Camera();
 ```
@@ -223,7 +293,7 @@ const camera = new G1Camera();
 | `getParam(paramId: number): Promise<number \| string>` | 按 ID 读取参数 |
 | `setParam(paramId: number, value: number \| string): Promise<void>` | 按 ID 设置参数 |
 
-#### 命名方法（部分示例）
+#### 命名方法
 
 每个参数都有一对 `getXxx()` / `setXxx()` 方法：
 
@@ -254,47 +324,40 @@ await camera.setCameraTime("2024-06-25 12:00:00");
 // ... 共约 50 组 getter/setter
 ```
 
-### dumpAll(camera)
+### Driver 基类（其他设备复用）
 
 ```typescript
-import { G1Camera } from './index';
-
-const camera = new G1Camera();
-await camera.connect('192.168.1.64');
-await dumpAll(camera);  // 打印全部参数
-camera.disconnect();
+import { Driver, ExtractResult, PendingCommand } from './Driver';
 ```
 
-输出示例：
-```
---- 照片参数 ---
-  ImageSize: 2
-  PhotoDelayTimer: 0
-  ...
---- 录像参数 ---
-  VideoSize: 0
-  FrameRate: 2
-  ...
---- 系统设置 ---
-  StaticIP: 1
-  PortNumber: 8888
-  ...
---- 字符串参数 ---
-  Ip: 192.168.1.65
-  CameraTime: 2022-01-01 00:10:25
-  ...
-```
+| 成员 | 可见性 | 说明 |
+|------|--------|------|
+| `stream` | protected | 当前 Duplex 流 |
+| `receiveBuffer` | protected | 接收缓冲区 |
+| `pending` | protected | 当前等待的命令 |
+| `timeout` | protected | 超时毫秒数 |
+| `attachStream(stream)` | protected | 绑定 Duplex 流并注册 data/close/error 监听 |
+| `detachStream()` | protected | 解绑流、reject pending、销毁流 |
+| `sendCommand(...args)` | protected | 组包 → 超时 → 写 → 等待响应 |
+| `handleResponse(resp)` | protected | 将解析后的响应投递给 pending promise（可覆写以处理主动推送） |
+| `buildCommandPacket(...)` | abstract | 子类实现：参数 → Buffer |
+| `parseResponsePacket(pkt)` | abstract | 子类实现：Buffer → 响应对象 |
+| `extractPacket()` | abstract | 子类实现：从 receiveBuffer 中切一个完整帧 |
+| `send(data)` | public | 原始写入，不等待响应 |
+| `disconnect()` | public | 断开连接 |
+| `isConnected()` | public | 是否已连接 |
 
 ## TCP 流处理
 
-TCP 是字节流，需处理粘包/半包：
+TCP 是字节流，需处理粘包/半包。Driver 基类自动完成：
 
-1. 收到数据追加到 `receiveBuffer`
-2. 扫描 `0x55` 响应头
-3. 读取长度字段，等待足够数据
-4. CRC-8 校验，提取完整响应包
-5. 从 `receiveBuffer` 中移除已处理的字节
-6. 继续循环直到 buffer 不够一个完整包
+1. `onData` 收到数据追加到 `receiveBuffer`
+2. 调用子类 `extractPacket()` 切帧——典型实现：扫描帧头 → 读长度 → 等够数据
+3. `parseResponsePacket()` 校验 CRC 并解析
+4. 从 `receiveBuffer` 中 consume 已处理字节
+5. 循环直到 buffer 不够一个完整包
+
+CRC 校验失败时自动跳过 1 字节并重新同步；连续垃圾数据（无帧头）自动清空缓冲区。
 
 ## 参考文档
 
