@@ -1,4 +1,4 @@
-import { crc8, buildCommandPacket, parseResponsePacket, RW_GET, RW_SET } from './G1Camera';
+import { crc8, G1Camera, RW_GET, RW_SET } from './G1Camera';
 
 /**
  * CRC-8 和组包/解包自测
@@ -27,27 +27,26 @@ export function selfTest(): void {
     const t5 = crc8([0x55, 0x0D, 0x07, 0x00, 0x02, ...respBytes]);
     console.assert(t5 === 0x53, `CRC test 5 failed: got 0x${t5.toString(16)}, expected 0x53`);
 
-    // Test 6: buildCommandPacket — Get IP
-    const pkt6 = buildCommandPacket(0x83, RW_GET);
+    // Test 6: G1Camera.buildCommandPacket — Get IP
+    const pkt6 = G1Camera.buildCommandPacket(0x83, RW_GET);
     const expected6 = Buffer.from([0xAA, 0x06, 0x07, 0x00, 0x83, 0x50]);
     console.assert(pkt6.equals(expected6), `Packet build test 6 failed`);
 
-    // Test 7: buildCommandPacket — Set IP
-    const pkt7 = buildCommandPacket(0x83, RW_SET, Buffer.from('192.168.1.65', 'ascii'));
+    // Test 7: G1Camera.buildCommandPacket — Set IP
+    const pkt7 = G1Camera.buildCommandPacket(0x83, RW_SET, Buffer.from('192.168.1.65', 'ascii'));
     const expected7 = Buffer.from([0xAA, 0x12, 0x07, 0x01, 0x83,
         0x31, 0x39, 0x32, 0x2E, 0x31, 0x36, 0x38, 0x2E, 0x31, 0x2E, 0x36, 0x35, 0xE8]);
     console.assert(pkt7.equals(expected7), `Packet build test 7 failed`);
 
-    // Test 8: parseResponsePacket
+    // Test 8: G1Camera.parseResponsePacket (throws on error, so no null check needed)
     const respPkt = Buffer.from([0x55, 0x0D, 0x07, 0x00, 0x02,
         0x47, 0x31, 0x45, 0x74, 0x65, 0x73, 0x74, 0x53]);
-    const parsed = parseResponsePacket(respPkt);
-    console.assert(parsed !== null, 'Parse test 8 failed: null');
-    console.assert(parsed!.rw === 0x00, `Parse test 8 rw failed`);
-    console.assert(parsed!.status === 0x02, `Parse test 8 status failed`);
-    // data now starts at byte4: [0x02, "G1Etest"], skip the leading type byte
-    console.assert(parsed!.data.subarray(1).toString('ascii') === 'G1Etest', `Parse test 8 data failed`);
-    console.assert(parsed!.data[0] === 0x02, `Parse test 8 data[0] failed`);
+    const parsed = G1Camera.parseResponsePacket(respPkt);
+    console.assert(parsed.rw === 0x00, `Parse test 8 rw failed`);
+    console.assert(parsed.status === 0x02, `Parse test 8 status failed`);
+    // data starts at byte4: [0x02, "G1Etest"], skip the leading type byte
+    console.assert(parsed.data.subarray(1).toString('ascii') === 'G1Etest', `Parse test 8 data failed`);
+    console.assert(parsed.data[0] === 0x02, `Parse test 8 data[0] failed`);
 
     console.log('All CRC-8 and packet tests passed.');
 }

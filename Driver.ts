@@ -32,6 +32,10 @@ export const DEFAULT_TIMEOUT = 5000;
  * Abstract base for device drivers that communicate over a Duplex stream
  * (TCP socket, serial port, etc.) using a request/response protocol.
  *
+ * @typeParam TArgs  — tuple type describing `buildCommandPacket` parameters.
+ *                     `sendCommand` inherits the same signature automatically.
+ * @typeParam TResponse — the parsed response type returned by `sendCommand`.
+ *
  * Subclasses implement three protocol-specific methods:
  *   - `buildCommandPacket`  — serialise a command into a wire-format Buffer
  *   - `extractPacket`       — find & extract one complete packet from the
@@ -41,8 +45,16 @@ export const DEFAULT_TIMEOUT = 5000;
  * The base class owns the whole send / receive pipeline:
  *   sendCommand → buildCommandPacket → setTimeout → pending → write
  *   onData → concat → extractPacket → parseResponsePacket → handleResponse → clearTimeout → resolve
+ *
+ * @example
+ * ```typescript
+ * class MyDevice extends Driver<[cmd: number, payload?: Buffer], MyResp> {
+ *     protected buildCommandPacket(cmd: number, payload?: Buffer): Buffer { ... }
+ *     // sendCommand(cmd, payload?) is now fully typed — no casting needed
+ * }
+ * ```
  */
-export abstract class Driver<TResponse = unknown> {
+export abstract class Driver<TArgs extends unknown[] = unknown[], TResponse = unknown> {
     // ---- State ----
 
     protected stream: Duplex | null = null;
@@ -122,9 +134,9 @@ export abstract class Driver<TResponse = unknown> {
 
     /**
      * Build a wire-format command packet from command arguments.
-     * Called by `sendCommand`.
+     * Called by `sendCommand` — both share the same parameter types via `TArgs`.
      */
-    protected abstract buildCommandPacket(...args: unknown[]): Buffer;
+    protected abstract buildCommandPacket(...args: TArgs): Buffer;
 
     /**
      * Parse a raw response packet into a typed response object.
@@ -161,7 +173,7 @@ export abstract class Driver<TResponse = unknown> {
      *
      * Only one command may be in-flight at a time.
      */
-    protected sendCommand(...args: unknown[]): Promise<TResponse> {
+    protected sendCommand(...args: TArgs): Promise<TResponse> {
         return new Promise((resolve, reject) => {
             if (!this.stream || this.stream.destroyed) {
                 return reject(new Error('Not connected'));

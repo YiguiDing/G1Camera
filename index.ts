@@ -8,9 +8,8 @@ import {
     ParsedResponse,
     PARAM_DEFS,
     crc8,
-    buildCommandPacket,
-    parseResponsePacket,
     G1Camera,
+    G1CommandArgs,
 } from './G1Camera';
 import { Driver, ExtractResult, PendingCommand, DEFAULT_TIMEOUT as DRIVER_DEFAULT_TIMEOUT } from './Driver';
 
@@ -26,8 +25,6 @@ export {
     DRIVER_DEFAULT_TIMEOUT,
     // G1-specific protocol
     crc8,
-    buildCommandPacket,
-    parseResponsePacket,
     HEADER_COMMAND,
     HEADER_RESPONSE,
     RW_GET,
@@ -37,6 +34,7 @@ export {
     ParsedResponse,
     PARAM_DEFS,
     G1Camera,
+    G1CommandArgs,
 };
 
 // ============================================================

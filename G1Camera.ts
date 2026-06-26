@@ -64,51 +64,6 @@ export function crc8(data: Buffer | number[]): number {
 }
 
 // ============================================================
-// Packet Build / Parse  (G1 protocol)
-// ============================================================
-
-/** Build a G1 command packet (module-level helper). */
-export function buildCommandPacket(paramId: number, rw: number, data?: Buffer): Buffer {
-    const dataLen = data ? data.length : 0;
-    const totalLen = 5 + dataLen + 1; // header(1) + len(1) + type(1) + rw(1) + paramId(1) + data + checksum(1)
-
-    const header = Buffer.from([HEADER_COMMAND, totalLen, TYPE_CONFIG, rw, paramId]);
-    const beforeCrc = data ? Buffer.concat([header, data]) : header;
-
-    const c = crc8(beforeCrc);
-    return Buffer.concat([beforeCrc, Buffer.from([c])]);
-}
-
-/** Parse a raw G1 response packet (module-level helper). */
-export function parseResponsePacket(buffer: Buffer): ParsedResponse | null {
-    if (buffer.length < 2) return null;           // need header + length
-
-    const header = buffer[0];
-    if (header !== HEADER_RESPONSE) return null;  // not a valid response start
-
-    const len = buffer[1];
-    if (buffer.length < len) return null;          // incomplete packet
-
-    const packet = buffer.subarray(0, len);
-
-    // Verify CRC-8 over all bytes except the checksum itself
-    const expectedCrc = crc8(packet.subarray(0, len - 1));
-    if (expectedCrc !== packet[len - 1]) {
-        throw new Error(
-            `CRC mismatch: expected 0x${expectedCrc.toString(16).padStart(2, '0')}, ` +
-            `got 0x${packet[len - 1].toString(16).padStart(2, '0')}`
-        );
-    }
-
-    const rw     = packet[3];
-    // byte 4+ is the payload: for GET-int it's [value], for GET-str it's [0x00, string...], for SET it's [0x02, echoed...]
-    const status = packet.length > 4 ? packet[4] : 0;
-    const data   = packet.subarray(4, len - 1);
-
-    return { rw, status, data };
-}
-
-// ============================================================
 // Parameter Definitions Table
 // ============================================================
 
@@ -180,10 +135,17 @@ export const PARAM_DEFS: Record<number, ParamDef> = {
 };
 
 // ============================================================
+// G1Camera — typed command args shared by buildCommandPacket & sendCommand
+// ============================================================
+
+/** Tuple type for G1 command parameters — inferred by both `buildCommandPacket` and `sendCommand`. */
+export type G1CommandArgs = [paramId: number, rw: number, data?: Buffer];
+
+// ============================================================
 // G1Camera Class — extends generic Driver for G1-camera protocol
 // ============================================================
 
-export class G1Camera extends Driver<ParsedResponse> {
+export class G1Camera extends Driver<G1CommandArgs, ParsedResponse> {
     private host: string = '';
     private port: number = DEFAULT_PORT;
 
@@ -227,22 +189,63 @@ export class G1Camera extends Driver<ParsedResponse> {
     }
 
     // ============================================================
-    // Driver abstract method implementations
+    // Static helpers — usable without an instance (e.g. selfTest)
     // ============================================================
 
-    /** Build a G1 command packet from [paramId, rw, data?]. */
-    protected buildCommandPacket(...args: unknown[]): Buffer {
-        const [paramId, rw, data] = args as [number, number, Buffer | undefined];
-        return buildCommandPacket(paramId, rw, data);
+    /** Build a G1 command packet. */
+    static buildCommandPacket(paramId: number, rw: number, data?: Buffer): Buffer {
+        const dataLen = data ? data.length : 0;
+        const totalLen = 5 + dataLen + 1; // header(1)+len(1)+type(1)+rw(1)+paramId(1) + data + checksum(1)
+
+        const header = Buffer.from([HEADER_COMMAND, totalLen, TYPE_CONFIG, rw, paramId]);
+        const beforeCrc = data ? Buffer.concat([header, data]) : header;
+
+        const c = crc8(beforeCrc);
+        return Buffer.concat([beforeCrc, Buffer.from([c])]);
     }
 
-    /** Parse a raw G1 response packet. Throws on CRC / format failure. */
-    protected parseResponsePacket(packet: Buffer): ParsedResponse {
-        const parsed = parseResponsePacket(packet);
-        if (!parsed) {
-            throw new Error('Invalid response packet');
+    /** Parse a raw G1 response packet.  Throws on any format / CRC failure. */
+    static parseResponsePacket(packet: Buffer): ParsedResponse {
+        if (packet.length < 2) {
+            throw new Error('Response packet too short');
         }
-        return parsed;
+
+        const header = packet[0];
+        if (header !== HEADER_RESPONSE) {
+            throw new Error(`Invalid response header: 0x${header.toString(16)}`);
+        }
+
+        const len = packet[1];
+        if (packet.length < len) {
+            throw new Error(`Incomplete response: expected ${len} bytes, got ${packet.length}`);
+        }
+
+        // CRC-8 over all bytes except the checksum itself
+        const expectedCrc = crc8(packet.subarray(0, len - 1));
+        if (expectedCrc !== packet[len - 1]) {
+            throw new Error(
+                `CRC mismatch: expected 0x${expectedCrc.toString(16).padStart(2, '0')}, ` +
+                `got 0x${packet[len - 1].toString(16).padStart(2, '0')}`
+            );
+        }
+
+        const rw     = packet[3];
+        const status = packet.length > 4 ? packet[4] : 0;
+        const data   = packet.subarray(4, len - 1);
+
+        return { rw, status, data };
+    }
+
+    // ============================================================
+    // Driver abstract method implementations (delegate to statics)
+    // ============================================================
+
+    protected buildCommandPacket(paramId: number, rw: number, data?: Buffer): Buffer {
+        return G1Camera.buildCommandPacket(paramId, rw, data);
+    }
+
+    protected parseResponsePacket(packet: Buffer): ParsedResponse {
+        return G1Camera.parseResponsePacket(packet);
     }
 
     /**
