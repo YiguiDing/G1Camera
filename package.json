@@ -2,13 +2,42 @@
   "name": "g1-camera",
   "version": "1.0.0",
   "description": "G1 Camera Control Protocol Client",
-  "main": "index.ts",
+  "author": "G1",
+  "main": "dist-electron/electron/main.js",
   "scripts": {
     "start": "npx ts-node index.ts",
-    "build": "npx tsc --noEmit"
+    "build": "npx tsc --noEmit",
+    "compile": "npx tsc -p tsconfig.electron.json && npx tsc -p tsconfig.ui.json",
+    "dev": "npm run compile && electron .",
+    "smoke": "npm run compile && electron . --smoke",
+    "dist": "npm run compile && electron-builder --win"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
     "typescript": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.g1.cameracontrol",
+    "productName": "G1相机控制",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "ui/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
   }
 }

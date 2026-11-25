@@ -9,8 +9,22 @@ import { Driver, ExtractResult } from './Driver';
 export const HEADER_COMMAND  = 0xAA;
 export const HEADER_RESPONSE = 0x55;
 const TYPE_CONFIG            = 0x07;
+/** 命令字0: 设备信息 (协议 2.3.1) */
+export const TYPE_DEVICE_INFO = 0x00;
+/** 命令字0: 快捷操作 (协议 2.3.2) */
+export const TYPE_QUICK      = 0x01;
 export const RW_GET          = 0x00;
 export const RW_SET          = 0x01;
+
+/** 相机错误码说明（协议 2.2.1） */
+export const ERROR_CODE_TEXT: Record<number, string> = {
+    0x00: '无错误',
+    0x01: '没有0xaa头字节',
+    0x02: '相机不支持该命令/参数',
+    0x03: '输入参数不等于计算总字节数',
+    0x04: '校验错误',
+    0xff: '忽略这条指令',
+};
 
 const CRC_POLY = 0xD5;
 
@@ -37,10 +51,49 @@ export interface ParamDef {
     byteCount?: number;
 }
 
+/**
+ * 相机回复包解析结果。回复格式（协议 2.2）：
+ *   [0x55][总字节数][命令字][错误码][数据类型][参数...][CRC]
+ * 例：55 07 07 00 01 01 A6
+ *       命令字=07 错误码=00(无错误) 数据类型=01(整型) 参数=01
+ */
 export interface ParsedResponse {
-    rw: number;
-    status: number;
+    /** 命令字（错误时为 0xff，否则回显发送的命令字） */
+    cmdWord: number;
+    /** 错误码：0x00 无错误；0x01 无头；0x02 命令错；0x03 长度错；0x04 校验错；0xff 忽略 */
+    errorCode: number;
+    /** 数据类型：0x01 整型 / 0x02 字符型 */
+    dataType: number;
+    /** 参数数据（不含数据类型字节） */
     data: Buffer;
+    /** @deprecated 同 errorCode，保留以兼容旧代码 */
+    rw: number;
+    /** @deprecated 同 dataType，保留以兼容旧代码 */
+    status: number;
+}
+
+/** 相机返回非 0 错误码时抛出的协议错误 */
+export class G1ProtocolError extends Error {
+    constructor(
+        /** 相机错误码（见 ERROR_CODE_TEXT） */
+        public readonly errorCode: number,
+        /** 命令字（错误回复为 0xff） */
+        public readonly cmdWord: number,
+        message: string,
+    ) {
+        super(message);
+        this.name = 'G1ProtocolError';
+    }
+
+    /** 该错误是否表示相机固件不支持此命令/参数 */
+    get unsupported(): boolean {
+        return this.errorCode === 0x02 || this.errorCode === 0x03 || this.errorCode === 0xff;
+    }
+
+    /** 人类可读的错误码说明 */
+    get errorText(): string {
+        return ERROR_CODE_TEXT[this.errorCode] ?? `未知错误码 0x${this.errorCode.toString(16)}`;
+    }
 }
 
 // ============================================================
@@ -135,11 +188,59 @@ export const PARAM_DEFS: Record<number, ParamDef> = {
 };
 
 // ============================================================
+// Quick-Command Definitions (协议 2.3.2 快捷操作)
+// ============================================================
+
+/**
+ * 快捷指令 ID — 命令字0 = 0x01，参数1 = 指令 ID
+ * 包格式: [0xAA][len][0x01][cmdId][subParam?][CRC] (len 为 5 或 6)
+ */
+export enum QuickCmd {
+    /**
+     * 切换模式 — 仅出现在协议 6.0 校验码示例 (aa 05 01 01 21)，
+     * 2.3.2 表格未列出，使用时请与相机实际行为核对。
+     */
+    SwitchMode = 0x01,
+    /** 开/关 WiFi（关闭 WiFi 时连接会断开） */
+    ToggleWifi = 0x03,
+    /** 快捷拍照 — 不管在哪种模式下都执行拍照 */
+    Capture    = 0x04,
+    /** 快捷录像 — 不管在哪种模式下都执行录像 */
+    Record     = 0x05,
+    /** 格式化存储卡 */
+    FormatSD   = 0x06,
+    /** 彩色/黑白模式 — 需要子参数 (ColorMode) */
+    ColorMode  = 0x07,
+    /** 相机陀螺仪校准 */
+    GyroCalib  = 0x08,
+    /** 设备重启 — 重启后 TCP 连接会断开 */
+    Reboot     = 0x09,
+    /** 放大/缩小倍率 — 需要子参数 (ZoomDirection) */
+    Zoom       = 0x0A,
+}
+
+/** ColorMode 快捷指令 (0x07) 的子参数 */
+export enum ColorMode {
+    /** 彩色模式 */
+    Color = 0x01,
+    /** 黑白模式 */
+    Bw    = 0x02,
+}
+
+/** Zoom 快捷指令 (0x0A) 的子参数 */
+export enum ZoomDirection {
+    /** 放大倍率 */
+    In  = 0x01,
+    /** 缩小倍率 */
+    Out = 0x02,
+}
+
+// ============================================================
 // G1Camera — typed command args shared by buildCommandPacket & sendCommand
 // ============================================================
 
 /** Tuple type for G1 command parameters — inferred by both `buildCommandPacket` and `sendCommand`. */
-export type G1CommandArgs = [paramId: number, rw: number, data?: Buffer];
+export type G1CommandArgs = [paramId: number, rw: number, data?: Buffer, cmdWord?: number];
 
 // ============================================================
 // G1Camera Class — extends generic Driver for G1-camera protocol
@@ -149,8 +250,8 @@ export class G1Camera extends Driver<G1CommandArgs, ParsedResponse> {
     private host: string = '';
     private port: number = DEFAULT_PORT;
 
-    constructor() {
-        super(undefined, DEFAULT_TIMEOUT);
+    constructor(timeout: number = DEFAULT_TIMEOUT) {
+        super(undefined, timeout);
     }
 
     // ---- Connection ----
@@ -192,14 +293,48 @@ export class G1Camera extends Driver<G1CommandArgs, ParsedResponse> {
     // Static helpers — usable without an instance (e.g. selfTest)
     // ============================================================
 
-    /** Build a G1 command packet. */
-    static buildCommandPacket(paramId: number, rw: number, data?: Buffer): Buffer {
+    /**
+     * Build a G1 command packet.
+     * @param cmdWord 命令字0 — 默认 0x07 (UI 参数获取/设置)，快捷操作为 0x01
+     */
+    static buildCommandPacket(paramId: number, rw: number, data?: Buffer, cmdWord: number = TYPE_CONFIG): Buffer {
         const dataLen = data ? data.length : 0;
         const totalLen = 5 + dataLen + 1; // header(1)+len(1)+type(1)+rw(1)+paramId(1) + data + checksum(1)
 
-        const header = Buffer.from([HEADER_COMMAND, totalLen, TYPE_CONFIG, rw, paramId]);
+        const header = Buffer.from([HEADER_COMMAND, totalLen, cmdWord, rw, paramId]);
         const beforeCrc = data ? Buffer.concat([header, data]) : header;
 
+        const c = crc8(beforeCrc);
+        return Buffer.concat([beforeCrc, Buffer.from([c])]);
+    }
+
+    /**
+     * Build a device-info request packet (协议 2.3.1).
+     * Layout: [0xAA][len][0x00][param][subParam?][CRC]
+     * 例：获取协议版本号 → aa 05 00 02 80
+     */
+    static buildDeviceInfoPacket(param: number, subParam?: number): Buffer {
+        const bytes = [HEADER_COMMAND, 0, TYPE_DEVICE_INFO, param];
+        if (subParam !== undefined) {
+            bytes.push(subParam);
+        }
+        bytes[1] = bytes.length + 1; // 包含校验位
+        const beforeCrc = Buffer.from(bytes);
+        return Buffer.concat([beforeCrc, Buffer.from([crc8(beforeCrc)])]);
+    }
+
+    /**
+     * Build a G1 quick-command packet (协议 2.3.2 快捷操作).
+     * Layout: [0xAA][len][0x01][cmdId][subParam?][CRC] — len 为 5 (无子参数) 或 6.
+     */
+    static buildQuickCommandPacket(cmdId: number, subParam?: number): Buffer {
+        const bytes = [HEADER_COMMAND, 0, TYPE_QUICK, cmdId];
+        if (subParam !== undefined) {
+            bytes.push(subParam);
+        }
+        bytes[1] = bytes.length + 1; // total length includes the checksum byte
+
+        const beforeCrc = Buffer.from(bytes);
         const c = crc8(beforeCrc);
         return Buffer.concat([beforeCrc, Buffer.from([c])]);
     }
@@ -229,19 +364,30 @@ export class G1Camera extends Driver<G1CommandArgs, ParsedResponse> {
             );
         }
 
-        const rw     = packet[3];
-        const status = packet.length > 4 ? packet[4] : 0;
-        const data   = packet.subarray(4, len - 1);
+        const cmdWord   = packet[2];
+        const errorCode = packet[3];
+        const dataType  = packet.length > 4 ? packet[4] : 0;
+        const data      = packet.subarray(5, len - 1); // 参数数据（跳过数据类型字节）
 
-        return { rw, status, data };
+        return { cmdWord, errorCode, dataType, data, rw: errorCode, status: dataType };
     }
 
     // ============================================================
     // Driver abstract method implementations (delegate to statics)
     // ============================================================
 
-    protected buildCommandPacket(paramId: number, rw: number, data?: Buffer): Buffer {
-        return G1Camera.buildCommandPacket(paramId, rw, data);
+    protected buildCommandPacket(paramId: number, rw: number, data?: Buffer, cmdWord?: number): Buffer {
+        if (cmdWord === TYPE_QUICK) {
+            // 快捷操作: paramId = 指令 ID, data[0] = 可选子参数
+            const sub = data && data.length > 0 ? data[0] : undefined;
+            return G1Camera.buildQuickCommandPacket(paramId, sub);
+        }
+        if (cmdWord === TYPE_DEVICE_INFO) {
+            // 设备信息: paramId = 参数, data[0] = 可选子参数
+            const sub = data && data.length > 0 ? data[0] : undefined;
+            return G1Camera.buildDeviceInfoPacket(paramId, sub);
+        }
+        return G1Camera.buildCommandPacket(paramId, rw, data, cmdWord);
     }
 
     protected parseResponsePacket(packet: Buffer): ParsedResponse {
@@ -288,15 +434,25 @@ export class G1Camera extends Driver<G1CommandArgs, ParsedResponse> {
 
         const resp = await this.sendCommand(paramId, RW_GET);
 
-        if (def.type === ParamType.String) {
-            return resp.data.length > 1 ? resp.data.subarray(1).toString('ascii') : '';
+        if (resp.errorCode !== 0x00) {
+            throw new G1ProtocolError(
+                resp.errorCode,
+                resp.cmdWord,
+                `GET param 0x${paramId.toString(16).toUpperCase()} failed: ` +
+                `error code 0x${resp.errorCode.toString(16)} (${ERROR_CODE_TEXT[resp.errorCode] ?? '未知'})`
+            );
         }
 
-        // Int type
-        if (def.byteCount === 2) {
-            return resp.data.length >= 3 ? resp.data.readUInt16LE(1) : resp.data.readUInt16LE(0);
+        if (def.type === ParamType.String) {
+            return resp.data.toString('ascii');
         }
-        return resp.data.length > 0 ? resp.data[0] : 0;
+
+        // Int type — 参数数据以字节 0 开始（dataType 已被剔除）
+        // 部分参数（如 0x00 照片分辨率）先返回全部可设值，当前值在最后一个字节
+        if (def.byteCount === 2) {
+            return resp.data.length >= 2 ? resp.data.readUInt16LE(0) : 0;
+        }
+        return resp.data.length > 0 ? resp.data[resp.data.length - 1] : 0;
     }
 
     /**
@@ -322,9 +478,44 @@ export class G1Camera extends Driver<G1CommandArgs, ParsedResponse> {
         }
 
         const resp = await this.sendCommand(paramId, RW_SET, data);
-        if (resp.data.length === 0 || (resp.data[0] !== 0x00 && resp.data[0] !== 0x02)) {
-            throw new Error(`SET param 0x${paramId.toString(16)} failed: ack=${resp.data.length > 0 ? resp.data[0] : 'none'}`);
+        if (resp.errorCode !== 0x00) {
+            throw new G1ProtocolError(
+                resp.errorCode,
+                resp.cmdWord,
+                `SET param 0x${paramId.toString(16).toUpperCase()} failed: ` +
+                `error code 0x${resp.errorCode.toString(16)} (${ERROR_CODE_TEXT[resp.errorCode] ?? '未知'})`
+            );
         }
+    }
+
+    /**
+     * 原始 GET 请求 — 不依赖 PARAM_DEFS，用于探测/诊断相机支持哪些参数 ID。
+     * 不检查错误码，直接返回解析结果。
+     */
+    async getParamRaw(paramId: number): Promise<ParsedResponse> {
+        return this.sendCommand(paramId, RW_GET);
+    }
+
+    /**
+     * 获取协议版本号（设备信息命令 0x00/0x02），如 "G1F02.3.0"
+     */
+    async getProtocolVersion(): Promise<string> {
+        const resp = await this.sendCommand(0x02, 0x00, undefined, TYPE_DEVICE_INFO);
+        if (resp.errorCode !== 0x00) {
+            throw new G1ProtocolError(resp.errorCode, resp.cmdWord, `获取协议版本号失败: ${ERROR_CODE_TEXT[resp.errorCode] ?? '未知'}`);
+        }
+        return resp.data.toString('ascii');
+    }
+
+    /**
+     * 获取相机版本号（设备信息命令 0x00/0x01）
+     */
+    async getCameraVersion(): Promise<string> {
+        const resp = await this.sendCommand(0x01, 0x00, undefined, TYPE_DEVICE_INFO);
+        if (resp.errorCode !== 0x00) {
+            throw new G1ProtocolError(resp.errorCode, resp.cmdWord, `获取相机版本号失败: ${ERROR_CODE_TEXT[resp.errorCode] ?? '未知'}`);
+        }
+        return resp.data.toString('ascii');
     }
 
     // ============================================================
@@ -519,4 +710,75 @@ export class G1Camera extends Driver<G1CommandArgs, ParsedResponse> {
      * 设置相机时间（格式: YYYY-MM-DD HH:MM:SS，需大于当前时间）
      */
     async setCameraTime(time: string): Promise<void>         { return this.setParam(0x85, time); }
+
+    // ============================================================
+    // High-level Quick-Command API — 快捷操作 (协议 2.3.2)
+    // ============================================================
+
+    /**
+     * 发送快捷操作指令（命令字0 = 0x01）。
+     * 响应错误码为 0x00 视为成功，否则抛出错误。
+     * @param cmdId     指令 ID（见 QuickCmd）
+     * @param subParam  可选子参数（ColorMode / ZoomDirection）
+     */
+    async quickCommand(cmdId: number, subParam?: number): Promise<void> {
+        const resp = await this.sendCommand(
+            cmdId,
+            RW_SET,
+            subParam === undefined ? undefined : Buffer.from([subParam]),
+            TYPE_QUICK,
+        );
+        if (resp.errorCode !== 0x00) {
+            throw new G1ProtocolError(
+                resp.errorCode,
+                resp.cmdWord,
+                `Quick command 0x${cmdId.toString(16).padStart(2, '0')} failed: ` +
+                `error code 0x${resp.errorCode.toString(16).padStart(2, '0')} (${ERROR_CODE_TEXT[resp.errorCode] ?? '未知'})`
+            );
+        }
+    }
+
+    /**
+     * 发送可能导致连接断开的快捷指令（重启 / 关 WiFi 等）。
+     * 指令发出后相机主动断开 TCP 属于预期行为，此时视为成功。
+     */
+    private async sendQuickCommandAllowDrop(cmdId: number, subParam?: number): Promise<void> {
+        try {
+            await this.quickCommand(cmdId, subParam);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // 相机重启/关闭WiFi 会主动断开连接，属预期行为
+            if (/(connection closed|disconnected|econnreset|connection reset|socket hang up)/i.test(msg)) {
+                return;
+            }
+            throw err;
+        }
+    }
+
+    /** 开/关 WiFi — 关闭 WiFi 时连接会断开（断开视为成功） */
+    async toggleWifi(): Promise<void>          { return this.sendQuickCommandAllowDrop(QuickCmd.ToggleWifi); }
+
+    /** 快捷拍照 — 不管在哪种模式下都执行拍照 */
+    async capturePhoto(): Promise<void>        { return this.quickCommand(QuickCmd.Capture); }
+
+    /** 快捷录像 — 不管在哪种模式下都执行录像（再次发送同指令停止录像） */
+    async toggleRecord(): Promise<void>        { return this.quickCommand(QuickCmd.Record); }
+
+    /** 格式化存储卡 */
+    async formatSDCard(): Promise<void>        { return this.quickCommand(QuickCmd.FormatSD); }
+
+    /** 设置彩色/黑白模式 */
+    async setColorMode(mode: ColorMode): Promise<void> { return this.quickCommand(QuickCmd.ColorMode, mode); }
+
+    /** 相机陀螺仪校准 */
+    async calibrateGyro(): Promise<void>       { return this.quickCommand(QuickCmd.GyroCalib); }
+
+    /**
+     * 设备重启 — 相机重启后 TCP 连接会断开（断开视为成功）。
+     * 重启完成后需要重新 connect() 才能继续控制相机。
+     */
+    async reboot(): Promise<void>              { return this.sendQuickCommandAllowDrop(QuickCmd.Reboot); }
+
+    /** 变焦 — 放大/缩小倍率 */
+    async zoom(direction: ZoomDirection): Promise<void> { return this.quickCommand(QuickCmd.Zoom, direction); }
 }

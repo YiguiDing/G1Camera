@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; style-src 'self'; script-src 'self'" />
+    <title>G1 相机控制</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <header class="toolbar">
+        <div class="brand">
+            <h1>G1 相机控制</h1>
+            <span id="status-badge" class="badge off">未连接</span>
+        </div>
+        <div class="connect-panel">
+            <input id="host-input" type="text" value="192.168.1.1" spellcheck="false" />
+            <input id="port-input" type="number" value="8888" min="1" max="65535" />
+            <button id="connect-btn" class="btn primary">连接</button>
+            <button id="disconnect-btn" class="btn">断开</button>
+        </div>
+    </header>
+
+    <main class="content">
+        <section class="panel quick-panel">
+            <h2>快捷指令</h2>
+            <div class="quick-grid">
+                <button class="btn quick" data-action="capturePhoto">📷 拍照</button>
+                <button class="btn quick" data-action="toggleRecord">🎥 录像</button>
+                <button class="btn quick danger" data-action="reboot">🔄 设备重启</button>
+                <button class="btn quick danger-outline" data-action="formatSDCard">💾 格式化卡</button>
+                <button class="btn quick" data-action="toggleWifi">📶 开/关 WiFi</button>
+                <button class="btn quick" data-action="calibrateGyro">🧭 陀螺仪校准</button>
+                <button class="btn quick" data-action="zoomIn">🔍 放大</button>
+                <button class="btn quick" data-action="zoomOut">🔍 缩小</button>
+                <button class="btn quick" data-action="setColorMode" data-arg="1">🎨 彩色模式</button>
+                <button class="btn quick" data-action="setColorMode" data-arg="2">🎨 黑白模式</button>
+            </div>
+            <p class="hint">提示：重启后相机约 10 秒恢复，请手动重新连接。</p>
+        </section>
+
+        <section class="panel params-panel">
+            <div class="panel-head">
+                <h2>参数</h2>
+                <button id="refresh-params-btn" class="btn">读取全部参数</button>
+            </div>
+            <div class="params-table-wrap">
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>参数</th>
+                            <th>ID</th>
+                            <th>当前值</th>
+                            <th>设置</th>
+                        </tr>
+                    </thead>
+                    <tbody id="params-tbody">
+                        <tr><td colspan="4" class="placeholder">点击「读取全部参数」加载</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel log-panel">
+            <div class="panel-head">
+                <h2>日志</h2>
+                <button id="clear-log-btn" class="btn small">清空</button>
+            </div>
+            <div id="log-box" class="log-box"></div>
+        </section>
+    </main>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

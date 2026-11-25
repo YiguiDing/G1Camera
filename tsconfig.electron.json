@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "./dist-electron",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "electron/**/*.ts",
+    "G1Camera.ts",
+    "Driver.ts"
+  ]
+}

@@ -3,6 +3,10 @@ import {
     HEADER_RESPONSE,
     RW_GET,
     RW_SET,
+    TYPE_QUICK,
+    QuickCmd,
+    ColorMode,
+    ZoomDirection,
     ParamType,
     ParamDef,
     ParsedResponse,
@@ -29,6 +33,10 @@ export {
     HEADER_RESPONSE,
     RW_GET,
     RW_SET,
+    TYPE_QUICK,
+    QuickCmd,
+    ColorMode,
+    ZoomDirection,
     ParamType,
     ParamDef,
     ParsedResponse,
@@ -144,14 +152,16 @@ export async function main() {
     const camera = new G1Camera();
 
     // 通过 TCP 连接相机（默认端口 8888）
-    await camera.connect('192.168.1.65', 8888);
+    await camera.connect('192.168.1.2', 8888);
     console.log('Connected to camera');
 
     // 设置相机IP地址
-    // await camera.setIp('192.168.1.65')
+    await camera.setIp('192.168.1.3')
 
     // 打印所有参数
     await dumpAll(camera);
+
+    await camera.reboot();
 
     camera.disconnect();
 }
